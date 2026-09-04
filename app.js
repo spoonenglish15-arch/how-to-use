@@ -54,6 +54,8 @@ let draggedId = null;
 let adminMode = false;
 let openItemId = null;
 let firebaseReady = false;
+let keepPasteFocus = false;
+const PASTE_HINT = "사진을 계속 붙여넣으면 아래에 차례로 추가됩니다 (Ctrl+V)\n또는 아래 버튼으로 사진 파일을 선택하세요";
 
 function loadLocalItems() {
   try {
@@ -177,6 +179,13 @@ function render() {
     }
     list.appendChild(wrapper);
   });
+
+  if (keepPasteFocus && openItemId) {
+    requestAnimationFrame(() => {
+      const zone = list.querySelector(`[data-id="${CSS.escape(openItemId)}"] .image-paste-zone`);
+      zone?.focus();
+    });
+  }
 }
 
 function setupDragAndDrop(wrapper, dragHandle, itemId) {
@@ -263,7 +272,10 @@ function createEditor(item) {
 }
 
 function createImagePicker(item) {
-  const pasteZone = el("div", "image-paste-zone", "캡처한 화면을 붙여넣으세요 (Ctrl+V)\n또는 아래 버튼으로 사진 파일을 선택하세요");
+  const count = getItemImages(item).length;
+  const pasteZone = el("div", "image-paste-zone", count
+    ? `현재 사진 ${count}장\n${PASTE_HINT}`
+    : PASTE_HINT);
   pasteZone.tabIndex = 0;
   pasteZone.contentEditable = "true";
   pasteZone.setAttribute("role", "button");
@@ -279,7 +291,7 @@ function createImagePicker(item) {
   fileButton.type = "button";
 
   const handleFiles = files => {
-    if (files.length) uploadImages(item, files);
+    if (files.length) uploadImages(item.id, files);
   };
 
   pasteZone.addEventListener("click", event => {
@@ -295,7 +307,7 @@ function createImagePicker(item) {
     const files = getClipboardImageFiles(event.clipboardData);
     event.preventDefault();
     event.stopPropagation();
-    pasteZone.textContent = "캡처한 화면을 붙여넣으세요 (Ctrl+V)\n또는 아래 버튼으로 사진 파일을 선택하세요";
+    pasteZone.textContent = count ? `현재 사진 ${count}장\n${PASTE_HINT}` : PASTE_HINT;
     if (!files.length) {
       showToast("클립보드에 이미지가 없습니다. '사진 파일 선택'을 이용해 주세요.");
       return;
@@ -409,8 +421,11 @@ async function editItem(item) {
   showToast("수정했습니다.");
 }
 
-async function uploadImages(item, files) {
-  if (!canEdit() || isPinnedItem(item) || !files.length) return;
+async function uploadImages(itemId, files) {
+  const item = items.find(current => current.id === itemId);
+  if (!canEdit() || !item || isPinnedItem(item) || !files.length) return;
+  openItemId = itemId;
+  keepPasteFocus = true;
   showToast("이미지를 저장하고 있습니다.");
   try {
     const uploaded = [];
@@ -422,20 +437,34 @@ async function uploadImages(item, files) {
     }
     if (!canUseFirebase()) {
       saveLocalItems(items.map(current =>
-        current.id === item.id
+        current.id === itemId
           ? { ...current, images: [...(current.images || []), ...uploaded] }
           : current
       ));
-      showToast("이미지를 추가했습니다.");
+      showToast(`사진을 ${uploaded.length}장 추가했습니다. 같은 목록에 계속 붙여넣으세요.`);
       return;
     }
-    await Promise.all(uploaded.map(image => addDoc(collection(db, "manualImages"), {
-      itemId: item.id,
-      url: image.url,
-      name: image.name,
-      createdAt: Date.now()
-    })));
-    showToast("이미지를 추가했습니다.");
+    for (let index = 0; index < uploaded.length; index += 1) {
+      const image = uploaded[index];
+      const createdAt = Date.now() + index;
+      const saved = await addDoc(collection(db, "manualImages"), {
+        itemId,
+        url: image.url,
+        name: image.name,
+        createdAt
+      });
+      extraImages = extraImages.some(current => current.id === saved.id)
+        ? extraImages
+        : [...extraImages, {
+          id: saved.id,
+          itemId,
+          url: image.url,
+          name: image.name,
+          createdAt
+        }];
+      render();
+    }
+    showToast(`사진을 ${uploaded.length}장 추가했습니다. 같은 목록에 계속 붙여넣으세요.`);
   } catch (error) {
     console.error(error);
     showToast(error?.message ? `저장 실패: ${error.message}` : "이미지 저장에 실패했습니다.");
@@ -602,7 +631,7 @@ document.addEventListener("paste", event => {
   const item = items.find(current => current.id === openItemId);
   if (!item || isPinnedItem(item)) return;
   event.preventDefault();
-  uploadImages(item, files);
+  uploadImages(openItemId, files);
 });
 adminToggle.addEventListener("click", () => {
   if (!isDesktop()) return;
