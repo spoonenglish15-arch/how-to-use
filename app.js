@@ -12,11 +12,6 @@ let query;
 let setDoc;
 let updateDoc;
 let writeBatch;
-let deleteObject;
-let getDownloadURL;
-let getStorage;
-let ref;
-let uploadBytes;
 
 const DEFAULT_ITEMS = [
   {
@@ -53,11 +48,12 @@ const isConfigured = firebaseConfig.apiKey !== "REPLACE_ME" &&
 const LOCAL_STORAGE_KEY = "spoon-manual-items";
 
 let db;
-let storage;
 let items = [];
+let extraImages = [];
 let draggedId = null;
 let adminMode = false;
 let openItemId = null;
+let firebaseReady = false;
 
 function loadLocalItems() {
   try {
@@ -147,7 +143,7 @@ function render() {
       inner.appendChild(downloads);
     }
 
-    (item.images || []).forEach((image, imageIndex) => {
+    getItemImages(item).forEach((image, imageIndex) => {
       const imageWrap = el("div", "manual-image-wrap");
       const img = el("img", "manual-image");
       img.src = image.url;
@@ -167,23 +163,7 @@ function render() {
     });
 
     if (canEdit() && !pinned) {
-      const pasteZone = el("div", "image-paste-zone", "캡처한 화면을 붙여넣으세요 (Ctrl+V)");
-      pasteZone.tabIndex = 0;
-      pasteZone.setAttribute("role", "button");
-      pasteZone.setAttribute("aria-label", `${item.title} 캡처 이미지 붙여넣기`);
-      pasteZone.addEventListener("click", event => {
-        event.stopPropagation();
-        pasteZone.focus();
-      });
-      pasteZone.addEventListener("paste", event => {
-        const files = getClipboardImageFiles(event.clipboardData);
-        if (!files.length) return;
-        event.preventDefault();
-        event.stopPropagation();
-        uploadImages(item, files);
-      });
-      inner.appendChild(pasteZone);
-      inner.appendChild(createEditor(item));
+      inner.append(createImagePicker(item), createEditor(item));
     }
 
     content.appendChild(inner);
@@ -236,7 +216,7 @@ async function saveDraggedOrder() {
       .map(node => node.dataset.id)
       .filter(id => id && !pinnedIds.includes(id))
   ];
-  if (!isConfigured) {
+  if (!canUseFirebase()) {
     const byId = new Map(items.map(item => [item.id, item]));
     saveLocalItems(orderedIds.map(id => byId.get(id)).filter(Boolean));
     showToast("목록 순서를 변경했습니다.");
@@ -282,6 +262,116 @@ function createEditor(item) {
   return editor;
 }
 
+function createImagePicker(item) {
+  const pasteZone = el("div", "image-paste-zone", "캡처한 화면을 붙여넣으세요 (Ctrl+V)\n또는 아래 버튼으로 사진 파일을 선택하세요");
+  pasteZone.tabIndex = 0;
+  pasteZone.contentEditable = "true";
+  pasteZone.setAttribute("role", "button");
+  pasteZone.setAttribute("aria-label", `${item.title} 캡처 이미지 붙여넣기`);
+
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.accept = "image/*";
+  fileInput.multiple = true;
+  fileInput.hidden = true;
+
+  const fileButton = el("button", "file-pick-button", "사진 파일 선택");
+  fileButton.type = "button";
+
+  const handleFiles = files => {
+    if (files.length) uploadImages(item, files);
+  };
+
+  pasteZone.addEventListener("click", event => {
+    event.stopPropagation();
+    pasteZone.focus();
+  });
+  pasteZone.addEventListener("keydown", event => {
+    if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "v") {
+      event.preventDefault();
+    }
+  });
+  pasteZone.addEventListener("paste", event => {
+    const files = getClipboardImageFiles(event.clipboardData);
+    event.preventDefault();
+    event.stopPropagation();
+    pasteZone.textContent = "캡처한 화면을 붙여넣으세요 (Ctrl+V)\n또는 아래 버튼으로 사진 파일을 선택하세요";
+    if (!files.length) {
+      showToast("클립보드에 이미지가 없습니다. '사진 파일 선택'을 이용해 주세요.");
+      return;
+    }
+    handleFiles(files);
+  });
+  ["dragenter", "dragover"].forEach(type => {
+    pasteZone.addEventListener(type, event => {
+      event.preventDefault();
+      event.stopPropagation();
+      pasteZone.classList.add("dragover");
+    });
+  });
+  pasteZone.addEventListener("dragleave", () => pasteZone.classList.remove("dragover"));
+  pasteZone.addEventListener("drop", event => {
+    event.preventDefault();
+    event.stopPropagation();
+    pasteZone.classList.remove("dragover");
+    const files = [...(event.dataTransfer?.files || [])].filter(file => file.type.startsWith("image/"));
+    handleFiles(files);
+  });
+  fileButton.addEventListener("click", event => {
+    event.stopPropagation();
+    fileInput.click();
+  });
+  fileInput.addEventListener("change", () => {
+    handleFiles([...fileInput.files]);
+    fileInput.value = "";
+  });
+
+  const wrap = el("div");
+  wrap.append(pasteZone, fileInput, fileButton);
+  return wrap;
+}
+
+function canUseFirebase() {
+  return isConfigured && firebaseReady && db;
+}
+
+function getItemImages(item) {
+  const stored = (item.images || []).filter(image => image?.url);
+  const extra = extraImages.filter(image => image.itemId === item.id);
+  return [...stored, ...extra];
+}
+
+function compressImage(file) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    const objectUrl = URL.createObjectURL(file);
+    image.onload = () => {
+      const maxWidth = 720;
+      const scale = Math.min(1, maxWidth / image.width);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(image.width * scale));
+      canvas.height = Math.max(1, Math.round(image.height * scale));
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#FFFBF7";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(objectUrl);
+      let quality = 0.72;
+      let dataUrl = canvas.toDataURL("image/jpeg", quality);
+      while (dataUrl.length > 900000 && quality > 0.4) {
+        quality -= 0.08;
+        dataUrl = canvas.toDataURL("image/jpeg", quality);
+      }
+      resolve(dataUrl);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("이미지를 읽지 못했습니다."));
+    };
+    image.src = objectUrl;
+  });
+}
+
 function getClipboardImageFiles(clipboardData) {
   const fromItems = [...(clipboardData?.items || [])]
     .filter(clipboardItem => clipboardItem.type.startsWith("image/"))
@@ -308,7 +398,7 @@ async function editItem(item) {
   if (title === null || !title.trim()) return;
   const changes = { title: title.trim() };
 
-  if (!isConfigured) {
+  if (!canUseFirebase()) {
     saveLocalItems(items.map(current =>
       current.id === item.id ? { ...current, ...changes } : current
     ));
@@ -321,15 +411,16 @@ async function editItem(item) {
 
 async function uploadImages(item, files) {
   if (!canEdit() || isPinnedItem(item) || !files.length) return;
-  showToast("이미지를 업로드하고 있습니다.");
+  showToast("이미지를 저장하고 있습니다.");
   try {
-    if (!isConfigured) {
-      const uploaded = await Promise.all([...files].map(file => new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve({ url: reader.result, name: file.name });
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      })));
+    const uploaded = [];
+    for (const file of files) {
+      uploaded.push({
+        url: await compressImage(file),
+        name: file.name || `capture-${Date.now()}.jpg`
+      });
+    }
+    if (!canUseFirebase()) {
       saveLocalItems(items.map(current =>
         current.id === item.id
           ? { ...current, images: [...(current.images || []), ...uploaded] }
@@ -338,41 +429,38 @@ async function uploadImages(item, files) {
       showToast("이미지를 추가했습니다.");
       return;
     }
-    const uploaded = [];
-    for (const file of files) {
-      const safeName = file.name.replace(/[^\w가-힣.-]/g, "_");
-      const path = `manual-images/${item.id}/${Date.now()}-${safeName}`;
-      const imageRef = ref(storage, path);
-      await uploadBytes(imageRef, file);
-      uploaded.push({ url: await getDownloadURL(imageRef), path, name: file.name });
-    }
-    await updateDoc(doc(db, "manualItems", item.id), {
-      images: [...(item.images || []), ...uploaded]
-    });
+    await Promise.all(uploaded.map(image => addDoc(collection(db, "manualImages"), {
+      itemId: item.id,
+      url: image.url,
+      name: image.name,
+      createdAt: Date.now()
+    })));
     showToast("이미지를 추가했습니다.");
   } catch (error) {
     console.error(error);
-    showToast("이미지 업로드에 실패했습니다.");
+    showToast(error?.message ? `저장 실패: ${error.message}` : "이미지 저장에 실패했습니다.");
   }
 }
 
 async function removeImageFromItem(item, imageIndex) {
   if (!canEdit() || isPinnedItem(item) || !confirm("이 이미지를 삭제할까요?")) return;
-  const image = item.images[imageIndex];
+  const image = getItemImages(item)[imageIndex];
   try {
-    if (!isConfigured) {
+    if (!canUseFirebase()) {
       saveLocalItems(items.map(current =>
         current.id === item.id
-          ? { ...current, images: current.images.filter((_, index) => index !== imageIndex) }
+          ? { ...current, images: (current.images || []).filter((_, index) => index !== imageIndex) }
           : current
       ));
       showToast("이미지를 삭제했습니다.");
       return;
     }
-    if (image.path) await deleteObject(ref(storage, image.path));
-    await updateDoc(doc(db, "manualItems", item.id), {
-      images: item.images.filter((_, index) => index !== imageIndex)
-    });
+    if (image.id && extraImages.some(current => current.id === image.id)) {
+      await deleteDoc(doc(db, "manualImages", image.id));
+    } else {
+      const stored = (item.images || []).filter(current => current !== image && current.url !== image.url);
+      await updateDoc(doc(db, "manualItems", item.id), { images: stored });
+    }
     showToast("이미지를 삭제했습니다.");
   } catch (error) {
     console.error(error);
@@ -383,13 +471,13 @@ async function removeImageFromItem(item, imageIndex) {
 async function removeItem(item) {
   if (!canEdit() || isPinnedItem(item) || !confirm(`"${item.title}" 목록을 삭제할까요?`)) return;
   try {
-    if (!isConfigured) {
+    if (!canUseFirebase()) {
       saveLocalItems(items.filter(current => current.id !== item.id));
       showToast("목록을 삭제했습니다.");
       return;
     }
-    await Promise.all((item.images || []).filter(image => image.path)
-      .map(image => deleteObject(ref(storage, image.path))));
+    const related = extraImages.filter(image => image.itemId === item.id);
+    await Promise.all(related.map(image => deleteDoc(doc(db, "manualImages", image.id))));
     await deleteDoc(doc(db, "manualItems", item.id));
     showToast("목록을 삭제했습니다.");
   } catch (error) {
@@ -402,7 +490,7 @@ async function addItem() {
   if (!canEdit()) return;
   const title = prompt("새 목록 제목");
   if (!title || !title.trim()) return;
-  if (!isConfigured) {
+  if (!canUseFirebase()) {
     saveLocalItems([
       ...items,
       {
@@ -436,10 +524,9 @@ async function seedDefaults() {
 }
 
 async function loadFirebase() {
-  const [appModule, firestoreModule, storageModule] = await Promise.all([
+  const [appModule, firestoreModule] = await Promise.all([
     import("https://www.gstatic.com/firebasejs/12.2.1/firebase-app.js"),
-    import("https://www.gstatic.com/firebasejs/12.2.1/firebase-firestore.js"),
-    import("https://www.gstatic.com/firebasejs/12.2.1/firebase-storage.js")
+    import("https://www.gstatic.com/firebasejs/12.2.1/firebase-firestore.js")
   ]);
   ({ initializeApp } = appModule);
   ({
@@ -456,49 +543,64 @@ async function loadFirebase() {
     updateDoc,
     writeBatch
   } = firestoreModule);
-  ({
-    deleteObject,
-    getDownloadURL,
-    getStorage,
-    ref,
-    uploadBytes
-  } = storageModule);
 }
 
 function startFirebase() {
   const app = initializeApp(firebaseConfig);
   db = getFirestore(app);
-  storage = getStorage(app);
 
   seedDefaults().catch(error => {
     console.error(error);
-    status.textContent = "Firebase 권한 설정을 확인해 주세요.";
+    status.textContent = "Firebase 권한 설정을 확인해 주세요. Firestore 규칙을 다시 게시해 주세요.";
   });
 
   onSnapshot(
     query(collection(db, "manualItems"), orderBy("order")),
     snapshot => {
+      firebaseReady = true;
       items = snapshot.docs.map(document => ({ id: document.id, ...document.data() }));
       status.textContent = isDesktop() ? "PC 편집 모드" : "";
       render();
     },
     error => {
       console.error(error);
+      firebaseReady = false;
       status.textContent = "Firebase 연결 또는 권한 설정을 확인해 주세요.";
-      items = DEFAULT_ITEMS;
+      items = loadLocalItems();
       render();
+    }
+  );
+
+  onSnapshot(
+    collection(db, "manualImages"),
+    snapshot => {
+      extraImages = snapshot.docs
+        .map(document => ({ id: document.id, ...document.data() }))
+        .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+      render();
+    },
+    error => {
+      console.error(error);
     }
   );
 }
 
 addButton.addEventListener("click", addItem);
 document.addEventListener("paste", event => {
-  if (!canEdit() || !openItemId) return;
-  if (event.target.closest?.(".image-paste-zone")) return;
-  const item = items.find(current => current.id === openItemId);
-  if (!item || isPinnedItem(item)) return;
   const files = getClipboardImageFiles(event.clipboardData);
   if (!files.length) return;
+  if (event.target.closest?.(".image-paste-zone")) return;
+  if (!isDesktop()) return;
+  if (!adminMode) {
+    showToast("먼저 오른쪽 위 '관리자'를 눌러 주세요.");
+    return;
+  }
+  if (!openItemId) {
+    showToast("사진을 넣을 목록을 먼저 열어 주세요.");
+    return;
+  }
+  const item = items.find(current => current.id === openItemId);
+  if (!item || isPinnedItem(item)) return;
   event.preventDefault();
   uploadImages(item, files);
 });
